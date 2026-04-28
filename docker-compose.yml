@@ -1,0 +1,14 @@
+services:
+  relay:
+    build: .
+    image: ghcr.io/rogeecn/paseo-relay:latest
+    ports:
+      - "8443:8443"
+    environment:
+      - PORT=8443
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
