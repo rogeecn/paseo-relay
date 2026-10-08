@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -14,18 +15,31 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+const (
+	// Keepalive: relay pings every pingPeriod; a peer is considered dead if
+	// no pong (or any traffic) arrives within pongWait.
+	pongWait   = 60 * time.Second
+	pingPeriod = pongWait * 9 / 10
+	writeWait  = 10 * time.Second
+
+	// Per-connection outbound queue size. When full, the connection is
+	// dropped instead of blocking the relay (backpressure).
+	sendBuffer = 1024
+
+	// Max size of a single websocket message forwarded through the relay.
+	maxMessageSize = 32 << 20
+)
+
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 	CheckOrigin:     func(r *http.Request) bool { return true },
 }
 
-type session struct {
-	mu                sync.Mutex
-	controlSockets    []*socket
-	serverDataSockets map[string]*socket
-	clientSockets     map[string][]*socket
-	pendingFrames     map[string][]json.RawMessage
+// outbound is one message queued for the writer goroutine.
+type outbound struct {
+	msgType int
+	data    []byte
 }
 
 type socket struct {
@@ -34,6 +48,119 @@ type socket struct {
 	role         string
 	serverId     string
 	connectionId string
+
+	send   chan outbound
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newSocket(conn *websocket.Conn, version, role, serverId, connectionId string) *socket {
+	return &socket{
+		conn:         conn,
+		version:      version,
+		role:         role,
+		serverId:     serverId,
+		connectionId: connectionId,
+		send:         make(chan outbound, sendBuffer),
+		closed:       make(chan struct{}),
+	}
+}
+
+// enqueue schedules a write. It never touches conn directly, so it is safe to
+// call from any goroutine. gorilla/websocket allows only one concurrent
+// writer; all writes are serialized through writeLoop.
+func (ws *socket) enqueue(msgType int, data []byte) {
+	select {
+	case ws.send <- outbound{msgType, data}:
+	case <-ws.closed:
+	default:
+		// Peer is not draining fast enough. Drop the connection rather than
+		// blocking the relay or growing memory unbounded.
+		log.Printf("send buffer overflow, dropping %s(%s) in session %s", ws.role, ws.connectionId, ws.serverId)
+		ws.kill()
+	}
+}
+
+// closeWith sends a close frame (best effort) and terminates the connection.
+func (ws *socket) closeWith(code int, text string) {
+	ws.enqueue(websocket.CloseMessage, websocket.FormatCloseMessage(code, text))
+	go func() {
+		time.Sleep(200 * time.Millisecond) // give the writer a moment to flush the close frame
+		ws.kill()
+	}()
+}
+
+func (ws *socket) kill() {
+	ws.once.Do(func() {
+		close(ws.closed)
+		ws.conn.Close()
+	})
+}
+
+// writeLoop is the ONLY goroutine that calls WriteMessage on the conn.
+func (ws *socket) writeLoop() {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case m := <-ws.send:
+			ws.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := ws.conn.WriteMessage(m.msgType, m.data); err != nil {
+				ws.kill()
+				return
+			}
+		case <-ticker.C:
+			ws.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := ws.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				ws.kill()
+				return
+			}
+		case <-ws.closed:
+			return
+		}
+	}
+}
+
+// readLoop reads until error/timeout, dispatching to onMessage, then
+// guarantees conn teardown. It runs in the HTTP handler goroutine.
+func (ws *socket) readLoop(onMessage func(msgType int, data []byte)) {
+	defer func() {
+		if p := recover(); p != nil {
+			log.Printf("recovered panic on %s(%s) session %s: %v", ws.role, ws.connectionId, ws.serverId, p)
+		}
+		ws.kill()
+	}()
+
+	ws.conn.SetReadLimit(maxMessageSize)
+	ws.conn.SetReadDeadline(time.Now().Add(pongWait))
+	ws.conn.SetPongHandler(func(string) error {
+		ws.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return nil
+	})
+	ws.conn.SetPingHandler(func(appData string) error {
+		// WriteControl is documented safe for concurrent use; answering pings
+		// here keeps them flowing even when the outbound queue is saturated.
+		ws.conn.SetWriteDeadline(time.Now().Add(writeWait))
+		err := ws.conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(writeWait))
+		ws.conn.SetReadDeadline(time.Now().Add(pongWait))
+		return err
+	})
+
+	for {
+		msgType, data, err := ws.conn.ReadMessage()
+		if err != nil {
+			return
+		}
+		onMessage(msgType, data)
+	}
+}
+
+type session struct {
+	mu                sync.Mutex
+	controlSockets    []*socket
+	serverDataSockets map[string]*socket
+	clientSockets     map[string][]*socket
+	pendingFrames     map[string][]outbound
 }
 
 type relay struct {
@@ -53,26 +180,35 @@ func (r *relay) getSession(serverId string) *session {
 			controlSockets:    make([]*socket, 0),
 			serverDataSockets: make(map[string]*socket),
 			clientSockets:     make(map[string][]*socket),
-			pendingFrames:     make(map[string][]json.RawMessage),
+			pendingFrames:     make(map[string][]outbound),
 		}
 	}
 	return r.sessions[serverId]
 }
 
-func (r *relay) removeSession(serverId string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.sessions, serverId)
+// cleanupEmpty deletes the session if no sockets remain (fixes the leak:
+// removeSession was never called before).
+func (r *relay) cleanupEmpty(serverId string, s *session) {
+	s.mu.Lock()
+	empty := len(s.controlSockets) == 0 && len(s.serverDataSockets) == 0 && len(s.clientSockets) == 0
+	s.mu.Unlock()
+	if empty {
+		r.mu.Lock()
+		if r.sessions[serverId] == s {
+			delete(r.sessions, serverId)
+		}
+		r.mu.Unlock()
+		log.Printf("Session %s cleaned up", serverId)
+	}
 }
 
 func (s *session) notifyControls(msg interface{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	data, _ := json.Marshal(msg)
-	for _, ws := range s.controlSockets {
-		if err := ws.conn.WriteMessage(websocket.TextMessage, data); err != nil {
-			ws.conn.Close()
-		}
+	s.mu.Lock()
+	controls := append([]*socket(nil), s.controlSockets...)
+	s.mu.Unlock()
+	for _, c := range controls {
+		c.enqueue(websocket.TextMessage, data)
 	}
 }
 
@@ -88,73 +224,55 @@ func (s *session) listClientIds() []string {
 	return ids
 }
 
-func (s *session) bufferFrame(connId string, data json.RawMessage) {
+func (s *session) bufferFrame(connId string, m outbound) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	frames := s.pendingFrames[connId]
-	frames = append(frames, data)
+	frames = append(frames, m)
 	if len(frames) > 200 {
 		frames = frames[len(frames)-200:]
 	}
 	s.pendingFrames[connId] = frames
 }
 
+// flushFrames drains frames buffered while the server data socket was away.
+// It must be called BEFORE publishing ws into serverDataSockets, so buffered
+// frames are queued ahead of any live traffic (FIFO through the same writer).
 func (s *session) flushFrames(connId string, ws *socket) {
 	s.mu.Lock()
 	frames := s.pendingFrames[connId]
-	s.pendingFrames[connId] = nil
 	delete(s.pendingFrames, connId)
 	s.mu.Unlock()
 
 	for _, f := range frames {
-		if err := ws.conn.WriteMessage(websocket.TextMessage, f); err != nil {
-			s.bufferFrame(connId, f)
-			break
-		}
-	}
-}
-
-func (s *session) cleanupEmpty(serverId string) {
-	s.mu.Lock()
-	empty := len(s.controlSockets) == 0 && len(s.serverDataSockets) == 0 && len(s.clientSockets) == 0
-	s.mu.Unlock()
-	if empty {
-		log.Printf("Session %s cleaned up", serverId)
+		ws.enqueue(f.msgType, f.data)
 	}
 }
 
 func (r *relay) handleV1(ws *socket) {
 	s := r.getSession(ws.serverId)
+	go ws.writeLoop()
 
-	go func() {
-		for {
-			_, data, err := ws.conn.ReadMessage()
-			if err != nil {
-				log.Printf("v1:%s disconnected from session %s", ws.role, ws.serverId)
-				return
+	ws.readLoop(func(msgType int, data []byte) {
+		s.mu.Lock()
+		var targets []*socket
+		if ws.role == "client" {
+			// client -> server side
+			targets = append(targets, s.controlSockets...)
+			for _, ds := range s.serverDataSockets {
+				targets = append(targets, ds)
 			}
-			s.mu.Lock()
-			targetRole := "client"
-			if ws.role == "client" {
-				targetRole = "server"
+		} else {
+			// server -> all clients
+			for _, socks := range s.clientSockets {
+				targets = append(targets, socks...)
 			}
-			if targetRole == "client" {
-				for _, socks := range s.clientSockets {
-					for _, c := range socks {
-						c.conn.WriteMessage(websocket.TextMessage, data)
-					}
-				}
-			} else {
-				for _, ctrl := range s.controlSockets {
-					ctrl.conn.WriteMessage(websocket.TextMessage, data)
-				}
-				for _, ds := range s.serverDataSockets {
-					ds.conn.WriteMessage(websocket.TextMessage, data)
-				}
-			}
-			s.mu.Unlock()
 		}
-	}()
+		s.mu.Unlock()
+		for _, t := range targets {
+			t.enqueue(msgType, data)
+		}
+	})
 }
 
 func (r *relay) handleV2Control(ws *socket) {
@@ -163,66 +281,61 @@ func (r *relay) handleV2Control(ws *socket) {
 	s.controlSockets = append(s.controlSockets, ws)
 	s.mu.Unlock()
 
+	go ws.writeLoop()
+
 	syncMsg, _ := json.Marshal(map[string]interface{}{
 		"type":          "sync",
 		"connectionIds": s.listClientIds(),
 	})
-	ws.conn.WriteMessage(websocket.TextMessage, syncMsg)
+	ws.enqueue(websocket.TextMessage, syncMsg)
 
-	go func() {
-		for {
-			_, data, err := ws.conn.ReadMessage()
-			if err != nil {
-				s.mu.Lock()
-				s.controlSockets = removeSocket(s.controlSockets, ws)
-				s.mu.Unlock()
-				log.Printf("v2:server(control) disconnected from session %s", ws.serverId)
-				s.cleanupEmpty(ws.serverId)
-				return
-			}
-			var msg map[string]interface{}
-			if json.Unmarshal(data, &msg) == nil {
-				if msg["type"] == "ping" {
-					pong, _ := json.Marshal(map[string]interface{}{"type": "pong", "ts": time.Now().UnixMilli()})
-					ws.conn.WriteMessage(websocket.TextMessage, pong)
-				}
+	ws.readLoop(func(msgType int, data []byte) {
+		var msg map[string]interface{}
+		if json.Unmarshal(data, &msg) == nil {
+			if msg["type"] == "ping" {
+				pong, _ := json.Marshal(map[string]interface{}{"type": "pong", "ts": time.Now().UnixMilli()})
+				ws.enqueue(websocket.TextMessage, pong)
 			}
 		}
-	}()
+	})
+
+	s.mu.Lock()
+	s.controlSockets = removeSocket(s.controlSockets, ws)
+	s.mu.Unlock()
+	log.Printf("v2:server(control) disconnected from session %s", ws.serverId)
+	r.cleanupEmpty(ws.serverId, s)
 }
 
 func (r *relay) handleV2ServerData(ws *socket) {
 	s := r.getSession(ws.serverId)
+
+	go ws.writeLoop()
+
+	// Flush buffered frames first, then publish: guarantees ordered delivery.
+	s.flushFrames(ws.connectionId, ws)
 	s.mu.Lock()
 	s.serverDataSockets[ws.connectionId] = ws
 	s.mu.Unlock()
 
-	r.flushFramesTo(ws)
-
-	go func() {
-		for {
-			_, data, err := ws.conn.ReadMessage()
-			if err != nil {
-				s.mu.Lock()
-				delete(s.serverDataSockets, ws.connectionId)
-				for _, c := range s.clientSockets[ws.connectionId] {
-					c.conn.WriteMessage(websocket.CloseMessage,
-						websocket.FormatCloseMessage(1012, "Server disconnected"))
-				}
-				delete(s.clientSockets, ws.connectionId)
-				s.mu.Unlock()
-				log.Printf("v2:server(data:%s) disconnected from session %s", ws.connectionId, ws.serverId)
-				s.cleanupEmpty(ws.serverId)
-				return
-			}
-			s.mu.Lock()
-			clients := s.clientSockets[ws.connectionId]
-			s.mu.Unlock()
-			for _, c := range clients {
-				c.conn.WriteMessage(websocket.TextMessage, data)
-			}
+	ws.readLoop(func(msgType int, data []byte) {
+		s.mu.Lock()
+		clients := append([]*socket(nil), s.clientSockets[ws.connectionId]...)
+		s.mu.Unlock()
+		for _, c := range clients {
+			c.enqueue(msgType, data)
 		}
-	}()
+	})
+
+	s.mu.Lock()
+	if cur, ok := s.serverDataSockets[ws.connectionId]; ok && cur == ws {
+		delete(s.serverDataSockets, ws.connectionId)
+	}
+	for _, c := range s.clientSockets[ws.connectionId] {
+		c.closeWith(1012, "Server disconnected")
+	}
+	s.mu.Unlock()
+	log.Printf("v2:server(data:%s) disconnected from session %s", ws.connectionId, ws.serverId)
+	r.cleanupEmpty(ws.serverId, s)
 }
 
 func (r *relay) handleV2Client(ws *socket) {
@@ -238,73 +351,72 @@ func (r *relay) handleV2Client(ws *socket) {
 	s.clientSockets[ws.connectionId] = append(s.clientSockets[ws.connectionId], ws)
 	s.mu.Unlock()
 
+	go ws.writeLoop()
+
 	// Notify daemon that a client connected
 	s.notifyControls(map[string]interface{}{
-		"type":          "connected",
-		"connectionId":  ws.connectionId,
+		"type":         "connected",
+		"connectionId": ws.connectionId,
 	})
 
-	go func() {
-		for {
-			_, data, err := ws.conn.ReadMessage()
-			if err != nil {
-				s.mu.Lock()
-				s.clientSockets[ws.connectionId] = removeSocket(s.clientSockets[ws.connectionId], ws)
-				if len(s.clientSockets[ws.connectionId]) == 0 {
-					delete(s.clientSockets, ws.connectionId)
-					delete(s.pendingFrames, ws.connectionId)
-					if ds, ok := s.serverDataSockets[ws.connectionId]; ok {
-						ds.conn.WriteMessage(websocket.CloseMessage,
-							websocket.FormatCloseMessage(1001, "Client disconnected"))
-						delete(s.serverDataSockets, ws.connectionId)
-					}
-					s.mu.Unlock()
-					s.notifyControls(map[string]interface{}{
-						"type":         "disconnected",
-						"connectionId": ws.connectionId,
-					})
-				} else {
-					s.mu.Unlock()
-				}
-				log.Printf("v2:client(%s) disconnected from session %s", ws.connectionId, ws.serverId)
-				s.cleanupEmpty(ws.serverId)
-				return
-			}
-
-			// Try to extract connectionId from e2ee handshake message
+	ws.readLoop(func(msgType int, data []byte) {
+		// Try to extract connectionId from e2ee handshake message.
+		// Cheap guard: only parse small text frames that mention the key.
+		if msgType == websocket.TextMessage && len(data) <= 4096 && bytes.Contains(data, []byte("connectionId")) {
 			var msg map[string]interface{}
 			if json.Unmarshal(data, &msg) == nil {
 				if cid, ok := msg["connectionId"].(string); ok && cid != "" && ws.connectionId != cid {
 					log.Printf("Client connectionId updated from %s to %s", ws.connectionId, cid)
 					s.mu.Lock()
-					// Move socket from old connectionId to new one
 					s.clientSockets[ws.connectionId] = removeSocket(s.clientSockets[ws.connectionId], ws)
 					ws.connectionId = cid
 					s.clientSockets[ws.connectionId] = append(s.clientSockets[ws.connectionId], ws)
 					s.mu.Unlock()
-					// Re-notify daemon with correct connectionId
 					s.notifyControls(map[string]interface{}{
-						"type":          "connected",
-						"connectionId":  ws.connectionId,
+						"type":         "connected",
+						"connectionId": ws.connectionId,
 					})
 				}
 			}
-
-			s.mu.Lock()
-			serverWs := s.serverDataSockets[ws.connectionId]
-			s.mu.Unlock()
-			if serverWs == nil {
-				s.bufferFrame(ws.connectionId, data)
-				continue
-			}
-			serverWs.conn.WriteMessage(websocket.TextMessage, data)
 		}
-	}()
-}
 
-func (r *relay) flushFramesTo(ws *socket) {
-	s := r.getSession(ws.serverId)
-	s.flushFrames(ws.connectionId, ws)
+		s.mu.Lock()
+		serverWs := s.serverDataSockets[ws.connectionId]
+		s.mu.Unlock()
+		if serverWs == nil {
+			s.bufferFrame(ws.connectionId, outbound{msgType, data})
+			return
+		}
+		serverWs.enqueue(msgType, data)
+	})
+
+	// Cleanup on disconnect.
+	s.mu.Lock()
+	remaining := removeSocket(s.clientSockets[ws.connectionId], ws)
+	s.clientSockets[ws.connectionId] = remaining
+	last := len(remaining) == 0
+	var ds *socket
+	if last {
+		delete(s.clientSockets, ws.connectionId)
+		delete(s.pendingFrames, ws.connectionId)
+		ds = s.serverDataSockets[ws.connectionId]
+		if ds != nil {
+			delete(s.serverDataSockets, ws.connectionId)
+		}
+	}
+	s.mu.Unlock()
+
+	if last {
+		if ds != nil {
+			ds.closeWith(1001, "Client disconnected")
+		}
+		s.notifyControls(map[string]interface{}{
+			"type":         "disconnected",
+			"connectionId": ws.connectionId,
+		})
+	}
+	log.Printf("v2:client(%s) disconnected from session %s", ws.connectionId, ws.serverId)
+	r.cleanupEmpty(ws.serverId, s)
 }
 
 func removeSocket(list []*socket, target *socket) []*socket {
@@ -326,7 +438,7 @@ func (r *relay) handleWS(w http.ResponseWriter, req *http.Request) {
 		version = "2"
 	}
 
-	log.Printf("WS request: role=%s serverId=%s connectionId=%s v=%s from=%s", 
+	log.Printf("WS request: role=%s serverId=%s connectionId=%s v=%s from=%s",
 		role, serverId, connectionId, version, req.RemoteAddr)
 
 	if role != "server" && role != "client" {
@@ -348,16 +460,10 @@ func (r *relay) handleWS(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	log.Printf("WS upgraded: role=%s serverId=%s connectionId=%s v=%s from=%s", 
+	log.Printf("WS upgraded: role=%s serverId=%s connectionId=%s v=%s from=%s",
 		role, serverId, connectionId, version, conn.RemoteAddr())
 
-	ws := &socket{
-		conn:         conn,
-		version:      version,
-		role:         role,
-		serverId:     serverId,
-		connectionId: connectionId,
-	}
+	ws := newSocket(conn, version, role, serverId, connectionId)
 
 	switch {
 	case version == "1":
