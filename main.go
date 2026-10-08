@@ -202,14 +202,73 @@ func (r *relay) cleanupEmpty(serverId string, s *session) {
 	}
 }
 
+// syncPayload builds the control-channel "sync" message (list of client ids).
+func (s *session) syncPayload() []byte {
+	payload, _ := json.Marshal(map[string]interface{}{
+		"type":          "sync",
+		"connectionIds": s.listClientIds(),
+	})
+	return payload
+}
+
 func (s *session) notifyControls(msg interface{}) {
 	data, _ := json.Marshal(msg)
 	s.mu.Lock()
-	controls := append([]*socket(nil), s.controlSockets...)
+	controls := make([]*socket, 0, len(s.controlSockets))
+	for _, c := range s.controlSockets {
+		select {
+		case <-c.closed:
+			// Dead socket: prune it instead of writing into the void
+			// (official relay closes+forgets controls whose writes fail).
+		default:
+			controls = append(controls, c)
+		}
+	}
+	s.controlSockets = controls
 	s.mu.Unlock()
 	for _, c := range controls {
 		c.enqueue(websocket.TextMessage, data)
 	}
+}
+
+// nudgeOrResetControlForConnection mirrors the official relay's self-healing
+// for a stalled daemon. A client just connected, so the daemon should open a
+// server-data socket for connectionId shortly:
+//   - 10s later with no data socket: push a fresh sync to the controls (nudge)
+//   - 5s after that, still none: force-close the controls (1011) so the daemon
+//     reconnects and re-syncs. Without this, a half-dead control channel
+//     leaves clients spinning forever.
+func (r *relay) nudgeOrResetControlForConnection(serverId string, s *session, connectionId string) {
+	time.AfterFunc(10*time.Second, func() {
+		s.mu.Lock()
+		hasData := s.serverDataSockets[connectionId] != nil
+		hasClients := len(s.clientSockets[connectionId]) > 0
+		controls := append([]*socket(nil), s.controlSockets...)
+		s.mu.Unlock()
+		if hasData || !hasClients {
+			return
+		}
+		log.Printf("v2: no data socket for %s in session %s 10s after client connect, nudging controls", connectionId, serverId)
+		payload := s.syncPayload()
+		for _, c := range controls {
+			c.enqueue(websocket.TextMessage, payload)
+		}
+
+		time.AfterFunc(5*time.Second, func() {
+			s.mu.Lock()
+			hasData := s.serverDataSockets[connectionId] != nil
+			hasClients := len(s.clientSockets[connectionId]) > 0
+			controls := append([]*socket(nil), s.controlSockets...)
+			s.mu.Unlock()
+			if hasData || !hasClients || len(controls) == 0 {
+				return
+			}
+			log.Printf("v2: control unresponsive for %s in session %s, forcing control reconnect", connectionId, serverId)
+			for _, c := range controls {
+				c.closeWith(1011, "Control unresponsive")
+			}
+		})
+	})
 }
 
 func (s *session) listClientIds() []string {
@@ -278,16 +337,19 @@ func (r *relay) handleV1(ws *socket) {
 func (r *relay) handleV2Control(ws *socket) {
 	s := r.getSession(ws.serverId)
 	s.mu.Lock()
-	s.controlSockets = append(s.controlSockets, ws)
+	// Identity preemption (matches official relay): a new control connection
+	// for the same serverId kicks the old one, so a zombie socket can never
+	// split the control route.
+	for _, old := range s.controlSockets {
+		log.Printf("v2: preempting stale control socket in session %s (1008)", ws.serverId)
+		old.closeWith(1008, "Replaced by new connection")
+	}
+	s.controlSockets = []*socket{ws}
 	s.mu.Unlock()
 
 	go ws.writeLoop()
 
-	syncMsg, _ := json.Marshal(map[string]interface{}{
-		"type":          "sync",
-		"connectionIds": s.listClientIds(),
-	})
-	ws.enqueue(websocket.TextMessage, syncMsg)
+	ws.enqueue(websocket.TextMessage, s.syncPayload())
 
 	ws.readLoop(func(msgType int, data []byte) {
 		var msg map[string]interface{}
@@ -314,6 +376,12 @@ func (r *relay) handleV2ServerData(ws *socket) {
 	// Flush buffered frames first, then publish: guarantees ordered delivery.
 	s.flushFrames(ws.connectionId, ws)
 	s.mu.Lock()
+	// Identity preemption (matches official relay): a new data socket for the
+	// same connectionId kicks the old one.
+	if old, ok := s.serverDataSockets[ws.connectionId]; ok && old != ws {
+		log.Printf("v2: preempting stale data socket for %s in session %s (1008)", ws.connectionId, ws.serverId)
+		old.closeWith(1008, "Replaced by new connection")
+	}
 	s.serverDataSockets[ws.connectionId] = ws
 	s.mu.Unlock()
 
@@ -327,11 +395,14 @@ func (r *relay) handleV2ServerData(ws *socket) {
 	})
 
 	s.mu.Lock()
+	// Only announce "server disconnected" if this socket was still the
+	// registered one — a preempted socket must not disturb the new one's
+	// clients.
 	if cur, ok := s.serverDataSockets[ws.connectionId]; ok && cur == ws {
 		delete(s.serverDataSockets, ws.connectionId)
-	}
-	for _, c := range s.clientSockets[ws.connectionId] {
-		c.closeWith(1012, "Server disconnected")
+		for _, c := range s.clientSockets[ws.connectionId] {
+			c.closeWith(1012, "Server disconnected")
+		}
 	}
 	s.mu.Unlock()
 	log.Printf("v2:server(data:%s) disconnected from session %s", ws.connectionId, ws.serverId)
@@ -353,11 +424,13 @@ func (r *relay) handleV2Client(ws *socket) {
 
 	go ws.writeLoop()
 
-	// Notify daemon that a client connected
+	// Notify daemon that a client connected, and arm the control watchdog:
+	// the daemon should open a data socket for this connectionId soon.
 	s.notifyControls(map[string]interface{}{
 		"type":         "connected",
 		"connectionId": ws.connectionId,
 	})
+	r.nudgeOrResetControlForConnection(ws.serverId, s, ws.connectionId)
 
 	ws.readLoop(func(msgType int, data []byte) {
 		// Try to extract connectionId from e2ee handshake message.
@@ -376,6 +449,7 @@ func (r *relay) handleV2Client(ws *socket) {
 						"type":         "connected",
 						"connectionId": ws.connectionId,
 					})
+					r.nudgeOrResetControlForConnection(ws.serverId, s, ws.connectionId)
 				}
 			}
 		}
